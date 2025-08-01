@@ -1,64 +1,99 @@
 import streamlit as st
 import pandas as pd
 import requests
-import io
-from difflib import SequenceMatcher
+from io import StringIO
+from sentence_transformers import SentenceTransformer, util
+from sklearn.preprocessing import MinMaxScaler
 
-st.set_page_config(page_title="AI Job Matcher", layout="wide")
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="AI Job Match", layout="wide")
+st.title("🤖 AI-Powered Job Matching Dashboard")
+st.write("This is a test version with Hippolyte's CV injected directly.")
 
-st.title("🔍 AI Job Matching Platform — Candidate Dashboard")
+# --- BERT MODEL ---
+model = SentenceTransformer("all-MiniLM-L6-v2")
 
-st.markdown("Upload your CV and let AI match you with real jobs from **Remotive**!")
+# --- STEP 1: Injected CV TEXT ---
+cv_text = """
+Hippolyte Guermonprez
+Currently seeking a 6-month internship in Private Jet Charter Sales in Switzerland, with the goal of converting it to a full-time role. Experienced in business development, customer service, and international environments.
 
-# --- Upload CV ---
-uploaded_file = st.file_uploader("📄 Upload your CV (CSV format)", type=["csv"])
+Experience:
+- Lemonway – Paris – Fintech – Business Development (Intern)
+- Autonomos – Paris – Account Manager – 2023
+- Décathlon – Sales Associate – 2022
 
-if uploaded_file:
-    try:
-        cv_df = pd.read_csv(uploaded_file)
-        st.success("CV uploaded and parsed successfully!")
-        st.dataframe(cv_df.head())
-    except Exception as e:
-        st.error(f"Error reading file: {e}")
-        st.stop()
+Education:
+- Paris School of Business – Bachelor's in Business
+- Languages: French (native), English (fluent), German (conversational)
 
-# --- Load Live Jobs from Remotive API ---
-@st.cache_data(show_spinner=False)
+Skills:
+- B2B Sales
+- CRM & Outreach Tools (Lemlist, HubSpot)
+- Cold Emailing, Lead Generation
+- Client Management & Communication
+"""
+
+# --- STEP 2: Fetch Live Jobs ---
 def fetch_remotive_jobs():
-    url = "https://remotive.io/api/remote-jobs"
-    try:
+    response = requests.get("https://remotive.io/api/remote-jobs")
+    if response.status_code == 200:
+        return pd.json_normalize(response.json()["jobs"])
+    return pd.DataFrame()
+
+def fetch_arbeitnow_jobs():
+    jobs = []
+    page = 1
+    while True:
+        url = f"https://www.arbeitnow.com/api/job-board-api?page={page}"
         response = requests.get(url)
         data = response.json()
-        return pd.DataFrame(data["jobs"])
-    except Exception as e:
-        st.error("Failed to fetch jobs from Remotive.")
-        return pd.DataFrame()
+        jobs.extend(data.get("data", []))
+        if not data.get("links", {}).get("next"):
+            break
+        page += 1
+    return pd.DataFrame(jobs)
 
-jobs_df = fetch_remotive_jobs()
-st.subheader("💼 Found {} Live Remote Jobs".format(len(jobs_df)))
+# --- STEP 3: Match Scoring ---
+def calculate_similarity(cv_text, job_text):
+    cv_embed = model.encode(cv_text, convert_to_tensor=True)
+    job_embed = model.encode(job_text, convert_to_tensor=True)
+    return float(util.cos_sim(cv_embed, job_embed).item())
 
-# --- Matching Logic ---
-def match_score(cv_text, job_title, job_desc):
-    combined_job = job_title + " " + job_desc
-    return round(SequenceMatcher(None, cv_text.lower(), combined_job.lower()).ratio() * 100, 2)
+def match_jobs(cv_text, jobs_df, title_col, desc_col):
+    jobs_df = jobs_df.copy()
+    jobs_df['combined'] = jobs_df[title_col].fillna('') + " " + jobs_df[desc_col].fillna('')
+    jobs_df['match_score'] = jobs_df['combined'].apply(lambda job: calculate_similarity(cv_text, job))
+    scaler = MinMaxScaler()
+    jobs_df['match_score'] = scaler.fit_transform(jobs_df[['match_score']])
+    return jobs_df.sort_values("match_score", ascending=False)
 
-if uploaded_file:
-    st.subheader("🎯 Top Matches")
+# --- MAIN LOGIC ---
+with st.spinner("🔍 Analyzing Hippolyte's CV and fetching jobs..."):
+    # Fetch jobs
+    remotive_df = fetch_remotive_jobs()
+    arbeitnow_df = fetch_arbeitnow_jobs()
 
-    # Convert full CV to text (basic)
-    cv_text_blob = " ".join(str(x) for x in cv_df.values.flatten())
+    # Harmonize columns
+    remotive_df = remotive_df.rename(columns={"title": "job_title", "description": "job_description"})
+    arbeitnow_df = arbeitnow_df.rename(columns={"title": "job_title", "description": "job_description"})
 
-    # Score all jobs
-    jobs_df["match_score"] = jobs_df.apply(
-        lambda row: match_score(cv_text_blob, row["title"], row["description"]), axis=1
-    )
+    all_jobs = pd.concat([remotive_df, arbeitnow_df], ignore_index=True)
+    all_jobs = all_jobs.dropna(subset=['job_title', 'job_description'])
 
-    top_matches = jobs_df.sort_values(by="match_score", ascending=False).head(10)
+    # Match jobs
+    results_df = match_jobs(cv_text, all_jobs, 'job_title', 'job_description')
+    top_matches = results_df.head(20)
 
-    for _, row in top_matches.iterrows():
-        with st.expander(f"{row['title']} at {row['company_name']} — Match: {row['match_score']}%"):
-            st.write(row["description"])
-            st.write(f"🌍 Location: {row['candidate_required_location']}")
-            st.write(f"🔗 [Apply here]({row['url']})")
-            st.button("✅ I'm Interested", key=row['id'])
+# --- DISPLAY RESULTS ---
+st.success("✅ Matching complete!")
+st.write("Here are Hippolyte's top matches:")
+
+for _, row in top_matches.iterrows():
+    st.markdown(f"### {row['job_title']} @ {row.get('company_name', 'Unknown')}")
+    st.markdown(f"📍 Location: {row.get('location', 'N/A')}  |  💡 Match Score: **{round(row['match_score']*100)}%**")
+    st.markdown(f"[🔗 View Job Posting]({row.get('url', row.get('job_url', '#'))})", unsafe_allow_html=True)
+    st.button("✅ I’m Interested", key=row['job_title'] + str(row['match_score']))
+    st.markdown("---")
+
 
