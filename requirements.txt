@@ -1,7 +1,6 @@
 streamlit
 pandas
 requests
-sentence-transformers
 scikit-learn
-
-
+sentence-transformers
+spacy
