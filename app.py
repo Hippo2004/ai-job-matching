@@ -14,7 +14,8 @@ st.write("This is a test version with Hippolyte's CV injected directly.")
 
 # --- BERT MODEL ---
 model = SentenceTransformer("all-MiniLM-L6-v2")
-nlp = spacy.load("en_core_web_sm")
+import en_core_web_sm
+nlp = en_core_web_sm.load()
 
 # --- STEP 1: Injected CV TEXT ---
 cv_text = """
