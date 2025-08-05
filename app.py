@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import requests
@@ -130,4 +131,6 @@ if missing:
 else:
     st.markdown("✅ Your profile covers most key areas from matched jobs!")
 
+# arbeitnow_df = fetch_arbeitnow_jobs()
+arbeitnow_df = pd.DataFrame()  # Skip it for now
 
