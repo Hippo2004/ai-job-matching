@@ -134,3 +134,4 @@ else:
 # arbeitnow_df = fetch_arbeitnow_jobs()
 arbeitnow_df = pd.DataFrame()  # Skip it for now
 
+response = requests.get("https://remotive.io/api/remote-jobs", timeout=10)
