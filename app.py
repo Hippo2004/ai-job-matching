@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import requests
@@ -16,15 +15,12 @@ st.write("This is a test version with Hippolyte's CV injected directly.")
 # --- BERT MODEL ---
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
-import spacy
-
 try:
     nlp = spacy.load("en_core_web_sm")
 except:
     from spacy.cli import download
     download("en_core_web_sm")
     nlp = spacy.load("en_core_web_sm")
-
 
 # --- STEP 1: Injected CV TEXT ---
 cv_text = """
@@ -47,25 +43,19 @@ Skills:
 - Client Management & Communication
 """
 
-# --- STEP 2: Fetch Live Jobs ---
+# --- STEP 2: Fetch Live Jobs (SAFE + TIMEOUT) ---
 def fetch_remotive_jobs():
-    response = requests.get("https://remotive.io/api/remote-jobs")
-    if response.status_code == 200:
-        return pd.json_normalize(response.json()["jobs"])
+    try:
+        response = requests.get("https://remotive.io/api/remote-jobs", timeout=10)
+        if response.status_code == 200:
+            return pd.json_normalize(response.json()["jobs"])
+    except Exception as e:
+        st.warning(f"⚠️ Failed to fetch Remotive jobs: {e}")
     return pd.DataFrame()
 
+# --- Skip Arbeitnow for now to avoid timeout ---
 def fetch_arbeitnow_jobs():
-    jobs = []
-    page = 1
-    while True:
-        url = f"https://www.arbeitnow.com/api/job-board-api?page={page}"
-        response = requests.get(url)
-        data = response.json()
-        jobs.extend(data.get("data", []))
-        if not data.get("links", {}).get("next"):
-            break
-        page += 1
-    return pd.DataFrame(jobs)
+    return pd.DataFrame()
 
 # --- STEP 3: Match Scoring ---
 def calculate_similarity(cv_text, job_text):
@@ -107,31 +97,30 @@ with st.spinner("🔍 Analyzing Hippolyte's CV and fetching jobs..."):
     all_jobs = pd.concat([remotive_df, arbeitnow_df], ignore_index=True)
     all_jobs = all_jobs.dropna(subset=['job_title', 'job_description'])
 
-    results_df = match_jobs(cv_text, all_jobs, 'job_title', 'job_description')
-    top_matches = results_df.head(20)
+    if all_jobs.empty:
+        st.error("❌ Could not fetch any job data. Please try again later.")
+    else:
+        results_df = match_jobs(cv_text, all_jobs, 'job_title', 'job_description')
+        top_matches = results_df.head(20)
 
-# --- DISPLAY RESULTS ---
-st.success("✅ Matching complete!")
-st.write("Here are Hippolyte's top matches:")
+        # --- DISPLAY RESULTS ---
+        st.success("✅ Matching complete!")
+        st.write("Here are Hippolyte's top matches:")
 
-for _, row in top_matches.iterrows():
-    st.markdown(f"### {row['job_title']} @ {row.get('company_name', 'Unknown')}")
-    st.markdown(f"📍 Location: {row.get('location', 'N/A')}  |  💡 Match Score: **{round(row['match_score']*100)}%**")
-    st.markdown(f"[🔗 View Job Posting]({row.get('url', row.get('job_url', '#'))})", unsafe_allow_html=True)
-    st.button("✅ I’m Interested", key=row['job_title'] + str(row['match_score']))
-    st.markdown("---")
+        for _, row in top_matches.iterrows():
+            st.markdown(f"### {row['job_title']} @ {row.get('company_name', 'Unknown')}")
+            st.markdown(f"📍 Location: {row.get('location', 'N/A')}  |  💡 Match Score: **{round(row['match_score']*100)}%**")
+            st.markdown(f"[🔗 View Job Posting]({row.get('url', row.get('job_url', '#'))})", unsafe_allow_html=True)
+            st.button("✅ I’m Interested", key=row['job_title'] + str(row['match_score']))
+            st.markdown("---")
 
-# --- SUGGEST IMPROVEMENTS ---
-missing = suggest_improvements(cv_text, top_matches['job_description'].tolist())
-if missing:
-    st.subheader("💡 Improve Your Profile to Match More Jobs")
-    st.markdown("These keywords appeared in top job matches but are not present in your CV:")
-    for word in missing:
-        st.markdown(f"- {word}")
-else:
-    st.markdown("✅ Your profile covers most key areas from matched jobs!")
+        # --- SUGGEST IMPROVEMENTS ---
+        missing = suggest_improvements(cv_text, top_matches['job_description'].tolist())
+        if missing:
+            st.subheader("💡 Improve Your Profile to Match More Jobs")
+            st.markdown("These keywords appeared in top job matches but are not present in your CV:")
+            for word in missing:
+                st.markdown(f"- {word}")
+        else:
+            st.markdown("✅ Your profile covers most key areas from matched jobs!")
 
-# arbeitnow_df = fetch_arbeitnow_jobs()
-arbeitnow_df = pd.DataFrame()  # Skip it for now
-
-response = requests.get("https://remotive.io/api/remote-jobs", timeout=10)
