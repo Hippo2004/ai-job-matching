@@ -1,51 +1,47 @@
 import os
+import uuid
 import time
-import json
-import numpy as np
-import pandas as pd
+from typing import Optional
+
 import streamlit as st
+import pandas as pd
 import requests
 
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from io import StringIO
+from pypdf import PdfReader
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.preprocessing import MinMaxScaler
 
-# =========================
-# Streamlit page config
-# =========================
+# ---------- SUPABASE ----------
+from supabase import create_client, Client
+
+# ---------- PAGE CONFIG ----------
 st.set_page_config(page_title="AI Job Match", layout="wide")
 st.title("🤖 AI-Powered Job Matching Dashboard")
 st.write("This is a test version with Hippolyte's CV injected directly.")
 
-# =========================
-# Robust HTTP session
-# =========================
-def make_session():
-    s = requests.Session()
-    retries = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        backoff_factor=0.8,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-        raise_on_status=False,
-    )
-    s.mount("https://", HTTPAdapter(max_retries=retries))
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; hippo2004-job-matcher/0.1; +https://streamlit.app)"
-    })
-    return s
+# ---------- SECRETS ----------
+SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
 
-SESSION = make_session()
+@st.cache_resource(show_spinner=False)
+def get_supabase() -> Optional[Client]:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+    try:
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception:
+        return None
 
-# =========================
-# Candidate profile (Phase 1: injected)
-# =========================
-CV_TEXT = """
+sb = get_supabase()
+
+# A stable per-session candidate id
+if "candidate_id" not in st.session_state:
+    st.session_state["candidate_id"] = str(uuid.uuid4())
+
+# ---------- DEFAULT CV (fallback) ----------
+DEFAULT_CV = """
 Hippolyte Guermonprez
 Currently seeking a 6-month internship in Private Jet Charter Sales in Switzerland, with the goal of converting it to a full-time role. Experienced in business development, customer service, and international environments.
 
@@ -63,227 +59,221 @@ Skills:
 - CRM & Outreach Tools (Lemlist, HubSpot)
 - Cold Emailing, Lead Generation
 - Client Management & Communication
-""".strip()
+"""
 
-# =========================
-# Optional ST embedder (fallback to TF-IDF)
-# =========================
-@st.cache_resource(show_spinner=False)
-def get_embedder(prefer_tfidf: bool = False):
-    if prefer_tfidf:
-        return ("tfidf", None)
+# ======================================================
+# Sidebar – sources, filters, controls
+# ======================================================
+with st.sidebar:
+    st.header("Settings")
+    source = st.selectbox("Job source", ["Arbeitnow"], index=0)
+    top_n = st.slider("How many matches to show", min_value=5, max_value=50, value=20, step=1)
+    location_filter = st.text_input("Filter by location (optional)", value="")
+    keyword_filter = st.text_input("Filter by keyword in title/desc (optional)", value="")
+    st.caption("Results are cached for performance. Use filters to refine quickly.")
 
-    try:
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
-        return ("st", model)
-    except Exception as e:
-        st.info("Using TF-IDF fallback (Sentence-Transformers unavailable).")
-        return ("tfidf", None)
+# ======================================================
+# CV Upload (CSV or PDF)
+# ======================================================
+st.subheader("1) Upload CV (CSV or PDF)")
+uploaded = st.file_uploader("Upload your CV (CSV with a 'text' column or PDF). Leave empty to use the default CV.", type=["csv", "pdf"])
 
-# =========================
-# Data fetchers (with caching)
-# =========================
-@st.cache_data(ttl=1800, show_spinner=False)  # 30 minutes
-def fetch_remotive():
-    url = "https://remotive.io/api/remote-jobs"
-    try:
-        r = SESSION.get(url, timeout=15)
-        if r.status_code != 200:
-            raise RuntimeError(f"{r.status_code} {r.reason}")
-        data = r.json().get("jobs", [])
-        df = pd.json_normalize(data)
-        # Normalize fields
-        df = df.rename(columns={
-            "title": "title",
-            "company_name": "company",
-            "candidate_required_location": "location",
-            "description": "description",
-            "url": "url"
-        })
-        df["source"] = "Remotive"
-        needed = ["title", "company", "location", "description", "url", "source"]
-        return df[needed].dropna(subset=["title", "description"])
-    except Exception as e:
-        return pd.DataFrame(), f"Remotive error: {e}"
+def load_cv_text(file) -> str:
+    if file is None:
+        return DEFAULT_CV.strip()
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_arbeitnow():
-    all_rows = []
-    page = 1
-    try:
-        while True:
-            url = f"https://www.arbeitnow.com/api/job-board-api?page={page}"
-            r = SESSION.get(url, timeout=15)
-            if r.status_code != 200:
-                break
-            payload = r.json()
-            rows = payload.get("data", [])
-            if not rows:
-                break
-            all_rows.extend(rows)
-            if not payload.get("links", {}).get("next"):
-                break
-            page += 1
-
-        if not all_rows:
-            return pd.DataFrame(), None
-
-        df = pd.DataFrame(all_rows)
-        df = df.rename(columns={
-            "title": "title",
-            "company_name": "company",
-            "location": "location",
-            "description": "description",
-            "url": "url"
-        })
-        df["source"] = "Arbeitnow"
-        needed = ["title", "company", "location", "description", "url", "source"]
-        return df[needed].dropna(subset=["title", "description"]), None
-    except Exception as e:
-        return pd.DataFrame(), f"Arbeitnow error: {e}"
-
-# Small static fallback so the UI never looks empty
-def fallback_jobs():
-    return pd.DataFrame([
-        {
-            "title": "Investment Intern (m/f/d)",
-            "company": "Signature Ventures GmbH",
-            "location": "Munich / Remote",
-            "description": "Support investment team, deal flow, analysis, and portfolio research.",
-            "url": "https://example.com/job/investment-intern",
-            "source": "Sample"
-        },
-        {
-            "title": "Social Media / Content Intern (BENELUX)",
-            "company": "KoRo Handels GmbH",
-            "location": "Berlin / Remote",
-            "description": "Help plan, create, and publish content. Community engagement, analytics.",
-            "url": "https://example.com/job/social-media-intern",
-            "source": "Sample"
-        }
-    ])
-
-# =========================
-# Matching
-# =========================
-def score_with_st(model, texts):
-    embs = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-    cv = embs[0]
-    jobs = np.array(embs[1:])
-    scores = jobs @ cv  # cosine because normalized
-    return scores
-
-def score_with_tfidf(texts):
-    vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=5000)
-    X = vec.fit_transform(texts)
-    cv = X[0]
-    jobs = X[1:]
-    scores = cosine_similarity(jobs, cv).ravel()
-    return scores
-
-def compute_match_scores(cv_text: str, df: pd.DataFrame, method, model):
-    df = df.copy()
-    df["combined"] = (df["title"].fillna("") + " " + df["description"].fillna("")).str.strip()
-    texts = [cv_text] + df["combined"].tolist()
-
-    if method == "st":
+    if file.name.lower().endswith(".csv"):
         try:
-            raw = score_with_st(model, texts)
-        except Exception:
-            # fall back if model errors
-            raw = score_with_tfidf(texts)
+            df = pd.read_csv(file)
+            if "text" in df.columns and not df["text"].dropna().empty:
+                return "\n".join(df["text"].dropna().astype(str).tolist())[:50000]
+            else:
+                # If no 'text' column, join everything
+                return "\n".join(
+                    " ".join(map(str, row.dropna().tolist()))
+                    for _, row in df.iterrows()
+                )[:50000]
+        except Exception as e:
+            st.warning(f"Could not read CSV: {e}. Using default CV.")
+            return DEFAULT_CV.strip()
+
+    if file.name.lower().endswith(".pdf"):
+        try:
+            reader = PdfReader(file)
+            pages = []
+            for p in reader.pages:
+                pages.append(p.extract_text() or "")
+            text = "\n".join(pages)
+            return (text or DEFAULT_CV).strip()[:50000]
+        except Exception as e:
+            st.warning(f"Could not read PDF: {e}. Using default CV.")
+            return DEFAULT_CV.strip()
+
+    return DEFAULT_CV.strip()
+
+cv_text = load_cv_text(uploaded)
+
+# ======================================================
+# Fetch jobs (Arbeitnow) – cached + retry + dedupe
+# ======================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_arbeitnow() -> pd.DataFrame:
+    jobs = []
+    page = 1
+    while True:
+        url = f"https://www.arbeitnow.com/api/job-board-api?page={page}"
+        ok = False
+        for attempt in range(3):
+            try:
+                r = requests.get(url, timeout=10)
+                if r.status_code == 200:
+                    data = r.json()
+                    jobs.extend(data.get("data", []))
+                    ok = True
+                    if not data.get("links", {}).get("next"):
+                        break
+                    page += 1
+                    time.sleep(0.2)
+                else:
+                    time.sleep(0.8)
+            except Exception:
+                time.sleep(0.8)
+        if not ok:
+            break
+        if not data.get("links", {}).get("next"):
+            break
+
+    if not jobs:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(jobs)
+    # Harmonize columns
+    df = df.rename(columns={
+        "title": "job_title",
+        "description": "job_description",
+        "location": "location",
+        "url": "url",
+        "company_name": "company_name",
+    })
+    # Dedupe by URL or title+company
+    if "url" in df.columns:
+        df = df.drop_duplicates(subset=["url"], keep="first")
+    if {"job_title", "company_name"} <= set(df.columns):
+        df = df.drop_duplicates(subset=["job_title", "company_name"], keep="first")
+    return df.reset_index(drop=True)
+
+# ======================================================
+# Matching via TF-IDF (fast & safe for Streamlit Cloud)
+# ======================================================
+def compute_matches(cv_text: str, df: pd.DataFrame, top_n: int) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    df = df.copy()
+    for col in ["job_title", "job_description", "company_name", "location", "url"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    # Apply filters
+    if location_filter:
+        df = df[df["location"].fillna("").str.contains(location_filter, case=False, na=False)]
+    if keyword_filter:
+        mask = (
+            df["job_title"].fillna("").str.contains(keyword_filter, case=False, na=False) |
+            df["job_description"].fillna("").str.contains(keyword_filter, case=False, na=False)
+        )
+        df = df[mask]
+
+    if df.empty:
+        return df
+
+    combined = (df["job_title"].fillna("") + " " + df["job_description"].fillna("")).tolist()
+    corpus = [cv_text] + combined  # index 0 is CV
+    tfidf = TfidfVectorizer(min_df=2, max_df=0.9, stop_words="english")
+    try:
+        X = tfidf.fit_transform(corpus)
+    except ValueError:
+        # Very small corpus edge case – fall back to raw strings
+        df["match_score"] = 0.0
+        return df.head(top_n)
+
+    sims = cosine_similarity(X[0:1], X[1:]).flatten()
+    df["match_score"] = sims
+    df = df.sort_values("match_score", ascending=False)
+    return df.head(top_n)
+
+# ======================================================
+# Supabase writes
+# ======================================================
+def ensure_candidate(sb: Client, candidate_id: str, cv_text: str):
+    try:
+        # Upsert candidate (by id)
+        sb.table("candidates").upsert({
+            "id": candidate_id,
+            "cv_text": cv_text[:60000]
+        }).execute()
+    except Exception as e:
+        st.warning(f"Could not upsert candidate: {e}")
+
+def log_interest(sb: Client, candidate_id: str, row: pd.Series, source: str):
+    try:
+        payload = {
+            "candidate_id": candidate_id,
+            "job_title": str(row.get("job_title", ""))[:500],
+            "company": str(row.get("company_name", ""))[:300],
+            "url": str(row.get("url", row.get("job_url", "")))[:1000],
+            "location": str(row.get("location", ""))[:300],
+            "source": source,
+            "match_score": float(row.get("match_score", 0.0))
+        }
+        sb.table("interests").insert(payload).execute()
+        st.toast("Saved your interest ✅", icon="✅")
+    except Exception as e:
+        st.error(f"Could not save interest: {e}")
+
+# ======================================================
+# MAIN
+# ======================================================
+with st.spinner("🔍 Fetching jobs and computing matches…"):
+    if source == "Arbeitnow":
+        jobs_df = fetch_arbeitnow()
     else:
-        raw = score_with_tfidf(texts)
+        jobs_df = pd.DataFrame()
 
-    # scale 0..1 for display
-    scaler = MinMaxScaler()
-    df["match_score"] = scaler.fit_transform(raw.reshape(-1, 1))
-    return df.sort_values("match_score", ascending=False)
+    if jobs_df.empty:
+        st.warning("No jobs returned from the source right now. Try again later or adjust filters.")
+        st.stop()
 
-def top_keywords(texts, n=12):
-    vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=8000)
-    X = vec.fit_transform(texts)
-    sums = np.asarray(X.sum(axis=0)).ravel()
-    terms = np.array(vec.get_feature_names_out())
-    idx = np.argsort(-sums)[:n]
-    return terms[idx].tolist()
-
-# =========================
-# UI controls
-# =========================
-st.sidebar.subheader("Settings")
-use_sources = st.sidebar.multiselect(
-    "Job sources", ["Remotive", "Arbeitnow"], default=["Remotive", "Arbeitnow"]
-)
-safe_mode = st.sidebar.toggle("Safe mode (use TF-IDF only)", value=False)
-top_k = st.sidebar.slider("How many matches to show", 5, 50, 20, 5)
-
-method, model = get_embedder(prefer_tfidf=safe_mode)
-
-# =========================
-# Fetch data
-# =========================
-frames = []
-alerts = []
-
-if "Remotive" in use_sources:
-    remotive_df, err = fetch_remotive()
-    if err:
-        alerts.append(err)
-    if not remotive_df.empty:
-        frames.append(remotive_df)
-
-if "Arbeitnow" in use_sources:
-    arbeit_df, err = fetch_arbeitnow()
-    if err:
-        alerts.append(err)
-    if not arbeit_df.empty:
-        frames.append(arbeit_df)
-
-if alerts:
-    for a in alerts:
-        st.warning(f"⚠️ {a}")
-
-if frames:
-    all_jobs = pd.concat(frames, ignore_index=True)
-else:
-    st.error("No jobs returned right now. Showing a small sample so you can test the flow.")
-    all_jobs = fallback_jobs()
-
-# =========================
-# Match + Display
-# =========================
-with st.spinner("🔎 Scoring matches..."):
-    results = compute_match_scores(CV_TEXT, all_jobs, method, model)
-    top = results.head(top_k)
+    top_matches = compute_matches(cv_text, jobs_df, top_n)
 
 st.success("✅ Matching complete!")
+st.write("Here are top matches:")
 
-if top.empty:
-    st.info("No results to show.")
-else:
-    st.write("Here are top matches:")
-    for i, row in top.reset_index(drop=True).iterrows():
-        st.markdown(f"### {row['title']} @ {row.get('company', 'Unknown')}")
-        st.markdown(
-            f"📍 **{row.get('location', 'N/A')}**  |  🏷️ **{row.get('source', '')}**  |  💡 Match: **{int(round(row['match_score']*100))}%**"
-        )
-        st.markdown(f"[🔗 View Job Posting]({row.get('url', '#')})", unsafe_allow_html=True)
-        st.button("✅ I’m Interested", key=f"btn_{i}")
-        st.markdown("---")
+# Ensure candidate exists in DB
+if sb:
+    ensure_candidate(sb, st.session_state["candidate_id"], cv_text)
 
-    # Lightweight “improve profile” ideas
-    st.subheader("💡 Improve Your Profile")
-    job_keywords = top_keywords(top["description"].tolist(), n=15)
-    cv_tokens = set([t for t in CV_TEXT.lower().split() if t.isalpha()])
-    missing = [kw for kw in job_keywords if kw.split()[0] not in cv_tokens]
-    if missing:
-        st.write("These keywords are common in matched jobs but missing from your CV:")
-        st.write(", ".join(missing))
-    else:
-        st.write("Your CV already covers most common keywords in these jobs.")
+for i, row in top_matches.reset_index(drop=True).iterrows():
+    st.markdown(f"### {row['job_title']} @ {row.get('company_name', 'Unknown')}")
+    st.markdown(
+        f"📍 {row.get('location','N/A')} &nbsp;&nbsp;|&nbsp;&nbsp; 🏷️ {source} "
+        f"&nbsp;&nbsp;|&nbsp;&nbsp; 🔢 Match: **{round(100*row.get('match_score',0))}%**",
+        unsafe_allow_html=True
+    )
+    url = row.get("url", row.get("job_url", ""))
+    if url:
+        st.markdown(f"[🔗 View Job Posting]({url})", unsafe_allow_html=True)
 
-st.caption("Tip: If Remotive errors again, deselect it in the sidebar and rely on Arbeitnow.")
+    cols = st.columns(2)
+    with cols[0]:
+        if st.button("✅ I'm Interested", key=f"interest_{i}"):
+            if sb:
+                log_interest(sb, st.session_state["candidate_id"], row, source)
+            else:
+                st.error("Supabase is not configured (missing secrets).")
+    with cols[1]:
+        st.caption((row.get("job_description") or "")[:200] + ("…" if len((row.get("job_description") or "")) > 200 else ""))
+    st.divider()
+
 
 
