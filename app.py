@@ -1,29 +1,15 @@
 import streamlit as st
 import pandas as pd
 import requests
-from io import StringIO
-from sentence_transformers import SentenceTransformer, util
-from sklearn.preprocessing import MinMaxScaler
-import spacy
-from collections import Counter
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
-# --- PAGE CONFIG ---
 st.set_page_config(page_title="AI Job Match", layout="wide")
 st.title("🤖 AI-Powered Job Matching Dashboard")
 st.write("This is a test version with Hippolyte's CV injected directly.")
 
-# --- BERT MODEL ---
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
-try:
-    nlp = spacy.load("en_core_web_sm")
-except:
-    from spacy.cli import download
-    download("en_core_web_sm")
-    nlp = spacy.load("en_core_web_sm")
-
-# --- STEP 1: Injected CV TEXT ---
-cv_text = """
+# ---- Hippolyte CV (injected for Phase 1) ----
+CV_TEXT = """
 Hippolyte Guermonprez
 Currently seeking a 6-month internship in Private Jet Charter Sales in Switzerland, with the goal of converting it to a full-time role. Experienced in business development, customer service, and international environments.
 
@@ -43,84 +29,65 @@ Skills:
 - Client Management & Communication
 """
 
-# --- STEP 2: Fetch Live Jobs (SAFE + TIMEOUT) ---
+# ---- Data sources ----
+REMOTIVE_API = "https://remotive.io/api/remote-jobs"
+
+@st.cache_data(ttl=1800)
 def fetch_remotive_jobs():
     try:
-        response = requests.get("https://remotive.io/api/remote-jobs", timeout=10)
-        if response.status_code == 200:
-            return pd.json_normalize(response.json()["jobs"])
+        r = requests.get(REMOTIVE_API, timeout=10)
+        r.raise_for_status()
+        df = pd.json_normalize(r.json().get("jobs", []))
+        if df.empty:
+            return df
+        # standardize columns we’ll use
+        keep = {
+            "title": "job_title",
+            "company_name": "company",
+            "description": "description",
+            "candidate_required_location": "location",
+            "url": "url"
+        }
+        df = df.rename(columns=keep)[list(keep.values())]
+        df["job_title"] = df["job_title"].fillna("")
+        df["description"] = df["description"].fillna("")
+        df["location"] = df["location"].fillna("N/A")
+        return df
     except Exception as e:
-        st.warning(f"⚠️ Failed to fetch Remotive jobs: {e}")
-    return pd.DataFrame()
+        st.warning(f"⚠️ Failed to fetch jobs from Remotive: {e}")
+        return pd.DataFrame(columns=["job_title","company","description","location","url"])
 
-# --- Skip Arbeitnow for now to avoid timeout ---
-def fetch_arbeitnow_jobs():
-    return pd.DataFrame()
-
-# --- STEP 3: Match Scoring ---
-def calculate_similarity(cv_text, job_text):
-    cv_embed = model.encode(cv_text, convert_to_tensor=True)
-    job_embed = model.encode(job_text, convert_to_tensor=True)
-    return float(util.cos_sim(cv_embed, job_embed).item())
-
-def match_jobs(cv_text, jobs_df, title_col, desc_col):
+def score_with_tfidf(cv_text: str, jobs_df: pd.DataFrame) -> pd.DataFrame:
+    if jobs_df.empty:
+        return jobs_df
+    docs = [cv_text] + (jobs_df["job_title"] + " " + jobs_df["description"]).tolist()
+    vect = TfidfVectorizer(stop_words="english", max_features=20000)
+    X = vect.fit_transform(docs)
+    cv_vec = X[0:1]
+    job_vecs = X[1:]
+    sims = cosine_similarity(cv_vec, job_vecs).ravel()  # 0..1
     jobs_df = jobs_df.copy()
-    jobs_df['combined'] = jobs_df[title_col].fillna('') + " " + jobs_df[desc_col].fillna('')
-    jobs_df['match_score'] = jobs_df['combined'].apply(lambda job: calculate_similarity(cv_text, job))
-    scaler = MinMaxScaler()
-    jobs_df['match_score'] = scaler.fit_transform(jobs_df[['match_score']])
+    jobs_df["match_score"] = sims
     return jobs_df.sort_values("match_score", ascending=False)
 
-# --- IMPROVEMENT SUGGESTIONS ---
-def extract_top_keywords(texts, top_n=10):
-    all_nouns = []
-    for text in texts:
-        doc = nlp(text)
-        all_nouns.extend([token.lemma_.lower() for token in doc if token.pos_ in ["NOUN", "PROPN"] and not token.is_stop])
-    return [word for word, _ in Counter(all_nouns).most_common(top_n)]
-
-def suggest_improvements(cv_text, job_texts):
-    top_keywords = extract_top_keywords(job_texts, top_n=15)
-    cv_doc = nlp(cv_text.lower())
-    cv_words = set([token.lemma_.lower() for token in cv_doc if token.pos_ in ["NOUN", "PROPN"]])
-    missing_keywords = [kw for kw in top_keywords if kw not in cv_words]
-    return missing_keywords
-
-# --- MAIN LOGIC ---
-with st.spinner("🔍 Analyzing Hippolyte's CV and fetching jobs..."):
-    remotive_df = fetch_remotive_jobs()
-    arbeitnow_df = fetch_arbeitnow_jobs()
-
-    remotive_df = remotive_df.rename(columns={"title": "job_title", "description": "job_description"})
-    arbeitnow_df = arbeitnow_df.rename(columns={"title": "job_title", "description": "job_description"})
-
-    all_jobs = pd.concat([remotive_df, arbeitnow_df], ignore_index=True)
-    all_jobs = all_jobs.dropna(subset=['job_title', 'job_description'])
-
-    if all_jobs.empty:
-        st.error("❌ Could not fetch any job data. Please try again later.")
+# ---- Main ----
+with st.spinner("🔍 Fetching jobs & computing matches..."):
+    jobs = fetch_remotive_jobs()
+    if jobs.empty:
+        st.error("No jobs returned right now. Try again in a bit.")
     else:
-        results_df = match_jobs(cv_text, all_jobs, 'job_title', 'job_description')
-        top_matches = results_df.head(20)
+        results = score_with_tfidf(CV_TEXT, jobs)
+        top = results.head(20)
 
-        # --- DISPLAY RESULTS ---
         st.success("✅ Matching complete!")
-        st.write("Here are Hippolyte's top matches:")
+        for _, row in top.iterrows():
+            title = row["job_title"] or "Untitled role"
+            company = row.get("company") or "Unknown"
+            score_pct = int(round(row["match_score"] * 100))
+            st.markdown(f"### {title} @ {company}")
+            st.markdown(f"📍 {row.get('location','N/A')}  |  💡 Match Score: **{score_pct}%**")
+            if row.get("url"):
+                st.markdown(f"[🔗 View Job Posting]({row['url']})", unsafe_allow_html=True)
+            st.divider()
 
-        for _, row in top_matches.iterrows():
-            st.markdown(f"### {row['job_title']} @ {row.get('company_name', 'Unknown')}")
-            st.markdown(f"📍 Location: {row.get('location', 'N/A')}  |  💡 Match Score: **{round(row['match_score']*100)}%**")
-            st.markdown(f"[🔗 View Job Posting]({row.get('url', row.get('job_url', '#'))})", unsafe_allow_html=True)
-            st.button("✅ I’m Interested", key=row['job_title'] + str(row['match_score']))
-            st.markdown("---")
-
-        # --- SUGGEST IMPROVEMENTS ---
-        missing = suggest_improvements(cv_text, top_matches['job_description'].tolist())
-        if missing:
-            st.subheader("💡 Improve Your Profile to Match More Jobs")
-            st.markdown("These keywords appeared in top job matches but are not present in your CV:")
-            for word in missing:
-                st.markdown(f"- {word}")
-        else:
-            st.markdown("✅ Your profile covers most key areas from matched jobs!")
 
